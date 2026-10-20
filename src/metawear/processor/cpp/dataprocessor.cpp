@@ -58,7 +58,7 @@ unordered_map<DataProcessorType, uint8_t> type_to_id= {
 struct DataProcessorState : public AsyncCreator {
     void *processor_context;
     MblMwFnDataProcessor processor_callback;
-    MblMwDataProcessor* next_processor;
+    MblMwDataProcessor* next_processor = nullptr;
     ProcessorEntriesHandler sync_handler;
     stack<ProcessorEntry> chain;
     uint8_t entry_id;
@@ -469,8 +469,13 @@ void create_dataprocessor_state_uri(const MblMwDataSignal* signal, stringstream&
 // Helper function - processor created
 static int32_t dataprocessor_created(MblMwMetaWearBoard *board, const uint8_t *response, uint8_t len) {
     auto state = GET_DATAPROCESSOR_STATE(board);
+    std::lock_guard<std::recursive_mutex> lock(state->mutex);
 
-    state->timeout->cancel();
+    // Arrived after the request timed out; next_processor was already freed.
+    if (!state->end_request() || state->next_processor == nullptr) {
+        return MBL_MW_STATUS_OK;
+    }
+
     state->next_processor->header.data_id = response[2];
 
     auto proc_parent = state->next_processor->parent();
@@ -484,8 +489,11 @@ static int32_t dataprocessor_created(MblMwMetaWearBoard *board, const uint8_t *r
         state->next_processor->state = nullptr;
     }
 
-    state->next_processor->owner->module_events.emplace(state->next_processor->header, state->next_processor);
-    state->processor_callback(state->processor_context, state->next_processor);
+    auto created = state->next_processor;
+    state->next_processor = nullptr;
+
+    created->owner->module_events.emplace(created->header, created);
+    state->processor_callback(state->processor_context, created);
     state->create_next(true);
 
     return MBL_MW_STATUS_OK;
@@ -550,6 +558,7 @@ void free_dataprocessor_module(void* state) {
 void disconnect_dataprocessor(MblMwMetaWearBoard* board) {
     auto state = GET_DATAPROCESSOR_STATE(board);
     if (state != nullptr) {
+        std::lock_guard<std::recursive_mutex> lock(state->mutex);
         state->pending_fns.clear();
     }
 }
@@ -601,21 +610,28 @@ MblMwDataProcessor* mbl_mw_dataprocessor_lookup_id(const MblMwMetaWearBoard* boa
 // Helper function - create processor
 void create_processor(MblMwDataSignal* source, MblMwDataProcessor* processor, void *context, MblMwFnDataProcessor processor_created) {
     auto state = GET_DATAPROCESSOR_STATE(processor->owner);
+    std::lock_guard<std::recursive_mutex> lock(state->mutex);
     state->pending_fns.push([state, processor, context, processor_created, source](void) -> void {
         state->next_processor= processor;
         state->processor_context= context;
         state->processor_callback= processor_created;
 
-        vector<uint8_t> command = { MBL_MW_MODULE_DATA_PROCESSOR, ORDINAL(DataProcessorRegister::ADD), source->header.module_id, 
+        vector<uint8_t> command = { MBL_MW_MODULE_DATA_PROCESSOR, ORDINAL(DataProcessorRegister::ADD), source->header.module_id,
                 source->header.register_id, source->header.data_id, source->get_data_ubyte(), type_to_id.at(processor->type) };
         command.insert(command.end(), (uint8_t*) processor->config, ((uint8_t*) processor->config) + processor->config_size);
 
-        state->timeout= ThreadPool::schedule([state](void) -> void {
+        auto token = state->begin_request();
+        state->timeout= ThreadPool::schedule([state, token](void) -> void {
+            std::lock_guard<std::recursive_mutex> lock(state->mutex);
+            if (!state->expire_request(token)) {
+                return;
+            }
             if (state->next_processor->state != nullptr) {
                 delete state->next_processor->state;
             }
             state->next_processor->remove = false;
             delete state->next_processor;
+            state->next_processor = nullptr;
             state->processor_callback(state->processor_context, nullptr);
 
             state->create_next(true);

@@ -29,8 +29,12 @@ struct TimerState : public AsyncCreator {
 // Helper function - timer created
 static int32_t timer_created(MblMwMetaWearBoard *board, const uint8_t *response, uint8_t len) {
     auto state = GET_TIMER_STATE(board);
+    std::lock_guard<std::recursive_mutex> lock(state->mutex);
 
-    state->timeout->cancel();
+    // Arrived after the request timed out; its callback has already reported failure.
+    if (!state->end_request()) {
+        return MBL_MW_STATUS_OK;
+    }
 
     MblMwTimer *new_timer = new MblMwTimer(ResponseHeader(MBL_MW_MODULE_TIMER, ORDINAL(TimerRegister::NOTIFY), response[2]), board);
     board->module_events.emplace(new_timer->header, new_timer);
@@ -78,6 +82,7 @@ void free_timer_module(void *state) {
 void disconnect_timer(MblMwMetaWearBoard* board) {
     auto state = GET_TIMER_STATE(board);
     if (state != nullptr) {
+        std::lock_guard<std::recursive_mutex> lock(state->mutex);
         state->pending_fns.clear();
     }
 }
@@ -85,6 +90,7 @@ void disconnect_timer(MblMwMetaWearBoard* board) {
 // Timer create
 void mbl_mw_timer_create(MblMwMetaWearBoard *board, uint32_t period, uint16_t repetitions, uint8_t delay, void *context, MblMwFnTimerPtr received_timer) {
     auto state = GET_TIMER_STATE(board);
+    std::lock_guard<std::recursive_mutex> lock(state->mutex);
 
     state->pending_fns.push([=](void) -> void {
         uint8_t command[9]= {MBL_MW_MODULE_TIMER, ORDINAL(TimerRegister::TIMER_ENTRY)};
@@ -94,7 +100,12 @@ void mbl_mw_timer_create(MblMwMetaWearBoard *board, uint32_t period, uint16_t re
 
         state->timer_callback= received_timer;
         state->timer_context= context;
-        state->timeout= ThreadPool::schedule([context, state, received_timer](void) -> void {
+        auto token = state->begin_request();
+        state->timeout= ThreadPool::schedule([context, state, received_timer, token](void) -> void {
+            std::lock_guard<std::recursive_mutex> lock(state->mutex);
+            if (!state->expire_request(token)) {
+                return;
+            }
             received_timer(context, nullptr);
             state->create_next(true);
         }, board->time_per_response);

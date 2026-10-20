@@ -145,7 +145,14 @@ struct MblMwDataLogger : public MblMwAnonymousDataSignal {
 
 // Helper function - response id received
 static int32_t logging_response_entry_id_received(MblMwMetaWearBoard *board, const uint8_t *response, uint8_t len) {
-    GET_LOGGER_STATE(board)->next_logger->add_entry_id(response[2], false);
+    auto state = GET_LOGGER_STATE(board);
+    std::lock_guard<std::recursive_mutex> lock(state->mutex);
+
+    // Arrived after the request timed out; next_logger was already freed.
+    if (state->next_logger == nullptr) {
+        return 0;
+    }
+    state->next_logger->add_entry_id(response[2], false);
     return 0;
 }
 
@@ -578,8 +585,12 @@ void MblMwDataLogger::add_entry_id(uint8_t id, bool anonymous) {
 
     if (!anonymous && (uint8_t) entry_ids.size() == n_req_entries) {
         auto state= GET_LOGGER_STATE(source->owner);
+        std::lock_guard<std::recursive_mutex> lock(state->mutex);
 
-        state->timeout->cancel();
+        // The timeout claimed the request first; it frees this logger and reports failure.
+        if (!state->end_request()) {
+            return;
+        }
 
         for(auto it: entry_ids) {
             state->data_loggers[it]= this;
@@ -702,6 +713,7 @@ void disconnect_logging(MblMwMetaWearBoard* board) {
     auto state = GET_LOGGER_STATE(board);
 
     if (state != nullptr) {
+        std::lock_guard<std::recursive_mutex> lock(state->mutex);
         state->pending_fns.clear();
         for(auto it: state->latest_tick) {
             state->rollback_timestamps[it.first] = it.second;
@@ -857,10 +869,16 @@ const char* mbl_mw_logger_generate_identifier(const MblMwDataLogger* signal) {
 // Log signal
 void mbl_mw_datasignal_log(MblMwDataSignal *signal, void *context, MblMwFnDataLoggerPtr logger_ready) {
     auto state= GET_LOGGER_STATE(signal->owner);
+    std::lock_guard<std::recursive_mutex> lock(state->mutex);
 
     state->pending_fns.push([=](void) -> void {
         state->next_logger= new MblMwDataLogger(signal, context, logger_ready);
-        state->timeout= ThreadPool::schedule([context, state, logger_ready](void) -> void {
+        auto token = state->begin_request();
+        state->timeout= ThreadPool::schedule([context, state, logger_ready, token](void) -> void {
+            std::lock_guard<std::recursive_mutex> lock(state->mutex);
+            if (!state->expire_request(token)) {
+                return;
+            }
             delete state->next_logger;
             state->next_logger = nullptr;
 
