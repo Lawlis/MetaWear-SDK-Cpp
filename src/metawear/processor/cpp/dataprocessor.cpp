@@ -471,8 +471,11 @@ static int32_t dataprocessor_created(MblMwMetaWearBoard *board, const uint8_t *r
     auto state = GET_DATAPROCESSOR_STATE(board);
     std::lock_guard<std::recursive_mutex> lock(state->mutex);
 
-    // Arrived after the request timed out; next_processor was already freed.
-    if (!state->end_request() || state->next_processor == nullptr) {
+    // Arrived after the request timed out; next_processor was already freed. The board still
+    // made the processor, so remove it rather than leave a slot nothing tracks.
+    if (!state->end_request()) {
+        uint8_t command[3]= { MBL_MW_MODULE_DATA_PROCESSOR, ORDINAL(DataProcessorRegister::REMOVE), response[2] };
+        SEND_COMMAND;
         return MBL_MW_STATUS_OK;
     }
 
@@ -499,35 +502,64 @@ static int32_t dataprocessor_created(MblMwMetaWearBoard *board, const uint8_t *r
     return MBL_MW_STATUS_OK;
 }
 
+// Helper function - read one link of a processor chain
+static void read_processor_config(shared_ptr<DataProcessorState> state, MblMwMetaWearBoard* board, uint8_t id) {
+    auto token = state->begin_request();
+    state->timeout= ThreadPool::schedule([state, token](void) -> void {
+        std::lock_guard<std::recursive_mutex> lock(state->mutex);
+        if (!state->expire_request(token)) {
+            return;
+        }
+        while(!state->chain.empty()) {
+            state->chain.pop();
+        }
+        // No callback here: the logger query that started this sync has an earlier timeout
+        // of the same length, which has already reported the failure.
+        state->create_next(true);
+    }, board->time_per_response);
+
+    uint8_t command[3] = { MBL_MW_MODULE_DATA_PROCESSOR, READ_REGISTER(ORDINAL(DataProcessorRegister::ADD)), id };
+    SEND_COMMAND;
+}
+
 // Helper function - processor config received
 static int32_t dataprocessor_config_received(MblMwMetaWearBoard *board, const uint8_t *response, uint8_t len) {
     auto state = GET_DATAPROCESSOR_STATE(board);
-    state->timeout->cancel();
-    
-    ProcessorEntry entry = {
-        state->entry_id,
-        static_cast<uint8_t>(response[5] & 0x1f),
-        static_cast<uint8_t>(((response[5] >> 5) & 0x7) + 1),
-        ResponseHeader(response[2], response[3], response[4])
-    };
-    entry.config.insert(entry.config.end(), response + 6, response + len);
+    stack<ProcessorEntry> synced;
+    {
+        std::lock_guard<std::recursive_mutex> lock(state->mutex);
 
-    state->chain.push(entry);
+        // Arrived after the read timed out; the sync was abandoned.
+        if (!state->end_request()) {
+            return MBL_MW_STATUS_OK;
+        }
 
-    if (response[2] == MBL_MW_MODULE_DATA_PROCESSOR && response[3] == ORDINAL(DataProcessorRegister::NOTIFY)) {
-        state->entry_id = response[4];
-        state->pending_fns.push([=](void) -> void {
-            state->timeout= ThreadPool::schedule([state, board](void) -> void {
-                board->anon_signals_created(board->anon_signals_context, board, nullptr, MBL_MW_STATUS_ERROR_TIMEOUT);
-                state->create_next(true);
-            }, board->time_per_response);
-    
-            uint8_t command[3] = { MBL_MW_MODULE_DATA_PROCESSOR, READ_REGISTER(ORDINAL(DataProcessorRegister::ADD)), response[4] };
-            SEND_COMMAND;
-        });
-    } else { 
-        state->sync_handler(board, state->chain);
+        ProcessorEntry entry = {
+            state->entry_id,
+            static_cast<uint8_t>(response[5] & 0x1f),
+            static_cast<uint8_t>(((response[5] >> 5) & 0x7) + 1),
+            ResponseHeader(response[2], response[3], response[4])
+        };
+        entry.config.insert(entry.config.end(), response + 6, response + len);
+
+        state->chain.push(entry);
+
+        if (response[2] == MBL_MW_MODULE_DATA_PROCESSOR && response[3] == ORDINAL(DataProcessorRegister::NOTIFY)) {
+            uint8_t parent_id = response[4];
+            state->entry_id = parent_id;
+            state->pending_fns.push([state, board, parent_id](void) -> void {
+                read_processor_config(state, board, parent_id);
+            });
+            state->create_next(true);
+            return MBL_MW_STATUS_OK;
+        }
+        synced = state->chain;
     }
+
+    // Called unlocked: the handler takes the logging lock, which is always taken before this one.
+    state->sync_handler(board, synced);
+
+    std::lock_guard<std::recursive_mutex> lock(state->mutex);
     state->create_next(true);
 
     return MBL_MW_STATUS_OK;
@@ -661,6 +693,7 @@ void modify_processor_configuration(MblMwDataProcessor *processor, uint8_t size)
 // Helper function - sync proc
 void sync_processor_chain(MblMwMetaWearBoard* board, uint8_t id, ProcessorEntriesHandler handler) {
     auto state = GET_DATAPROCESSOR_STATE(board);
+    std::lock_guard<std::recursive_mutex> lock(state->mutex);
 
     while(!state->chain.empty()) {
         state->chain.pop();
@@ -668,14 +701,8 @@ void sync_processor_chain(MblMwMetaWearBoard* board, uint8_t id, ProcessorEntrie
     state->entry_id = id;
     state->sync_handler = handler;
 
-    state->pending_fns.push([=](void) -> void {
-        state->timeout= ThreadPool::schedule([state, board](void) -> void {
-            board->anon_signals_created(board->anon_signals_context, board, nullptr, MBL_MW_STATUS_ERROR_TIMEOUT);
-            state->create_next(true);
-        }, board->time_per_response);
-
-        uint8_t command[3] = { MBL_MW_MODULE_DATA_PROCESSOR, READ_REGISTER(ORDINAL(DataProcessorRegister::ADD)), id };
-        SEND_COMMAND;
+    state->pending_fns.push([state, board, id](void) -> void {
+        read_processor_config(state, board, id);
     });
     state->create_next(false);
 }

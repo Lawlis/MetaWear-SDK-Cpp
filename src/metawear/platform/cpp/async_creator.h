@@ -34,6 +34,11 @@ struct AsyncCreator {
      * response already claimed it.
      */
     bool expire_request(uint64_t token);
+    /**
+     * Whether a request is still in flight, without claiming it. For a request that spans
+     * several responses, the intermediate ones use it to drop themselves once it timed out.
+     */
+    bool request_active();
 
 private:
     uint64_t request_token = 0;

@@ -148,8 +148,11 @@ static int32_t logging_response_entry_id_received(MblMwMetaWearBoard *board, con
     auto state = GET_LOGGER_STATE(board);
     std::lock_guard<std::recursive_mutex> lock(state->mutex);
 
-    // Arrived after the request timed out; next_logger was already freed.
+    // Arrived after the request timed out; next_logger was already freed. The board still
+    // made the entry, so remove it rather than leave a slot nothing tracks.
     if (state->next_logger == nullptr) {
+        uint8_t command[3] = { MBL_MW_MODULE_LOGGING, ORDINAL(LoggingRegister::REMOVE), response[2] };
+        SEND_COMMAND;
         return 0;
     }
     state->next_logger->add_entry_id(response[2], false);
@@ -205,21 +208,38 @@ static MblMwDataSignal* guessLogSource(MblMwMetaWearBoard* board, ResponseHeader
     return nullptr;
 }
 
+// Helper function - read one logger slot
+// The request stays in flight until queue_next_logger, including any processor chain sync the
+// slot needs, so this one timeout covers resolving the whole slot.
+static void read_logger_slot(shared_ptr<LoggerState> state, MblMwMetaWearBoard* board) {
+    auto token = state->begin_request();
+    state->timeout= ThreadPool::schedule([state, board, token](void) -> void {
+        std::lock_guard<std::recursive_mutex> lock(state->mutex);
+        if (!state->expire_request(token)) {
+            return;
+        }
+        board->anon_signals_created(board->anon_signals_context, board, nullptr, MBL_MW_STATUS_ERROR_TIMEOUT);
+        state->create_next(true);
+    }, board->time_per_response);
+
+    uint8_t command[3]= {MBL_MW_MODULE_LOGGING, READ_REGISTER(ORDINAL(LoggingRegister::TRIGGER)), state->queryLogId};
+    SEND_COMMAND;
+}
+
 // Helper function - queue
 static void queue_next_logger(MblMwMetaWearBoard* board) {
     auto state = GET_LOGGER_STATE(board);
-    state->timeout->cancel();
+    std::lock_guard<std::recursive_mutex> lock(state->mutex);
+
+    // The slot's read timed out while it was being resolved; the query already failed.
+    if (!state->end_request()) {
+        return;
+    }
 
     state->queryLogId++;
     if (state->queryLogId < board->module_info.at(MBL_MW_MODULE_LOGGING).extra[0]) {
-        state->pending_fns.push([=](void) -> void {
-            state->timeout= ThreadPool::schedule([state, board](void) -> void {
-                board->anon_signals_created(board->anon_signals_context, board, nullptr, MBL_MW_STATUS_ERROR_TIMEOUT);
-                state->create_next(true);
-            }, board->time_per_response);
-    
-            uint8_t command[3]= {MBL_MW_MODULE_LOGGING, READ_REGISTER(ORDINAL(LoggingRegister::TRIGGER)), state->queryLogId};
-            SEND_COMMAND;
+        state->pending_fns.push([state, board](void) -> void {
+            read_logger_slot(state, board);
         });
     } else {
         vector<uint8_t> sorted;
@@ -289,12 +309,19 @@ static void log_source_discovered(shared_ptr<LoggerState> state, MblMwDataSignal
 
 // Helper function - proc synced
 static void processor_synced(MblMwMetaWearBoard* board, stack<ProcessorEntry>& entries) {
+    auto state = GET_LOGGER_STATE(board);
+    std::lock_guard<std::recursive_mutex> lock(state->mutex);
+
+    // The slot's read timed out while its processor chain was being read.
+    if (!state->request_active()) {
+        return;
+    }
+
     auto type = guessLogSource(board, entries.top().source, entries.top().offset, entries.top().length);
     if (type == nullptr) {
         queue_next_logger(board);
         return;
     }
-    auto state = GET_LOGGER_STATE(board);
     auto fill_processor = [board](MblMwDataSignal* parent, const ProcessorEntry& entry) {
         auto next = MblMwDataProcessor::transform(parent, entry.config);
         next->header.data_id = entry.id;
@@ -353,6 +380,12 @@ static void processor_synced(MblMwMetaWearBoard* board, stack<ProcessorEntry>& e
 // Helper function - response read entry id
 static int32_t logging_response_read_entry_id(MblMwMetaWearBoard *board, const uint8_t *response, uint8_t len) {
     auto state = GET_LOGGER_STATE(board);
+    std::lock_guard<std::recursive_mutex> lock(state->mutex);
+
+    // Arrived after the slot's read timed out; the query already failed.
+    if (!state->request_active()) {
+        return 0;
+    }
 
     if (len > 2) { 
         uint8_t offset = (uint8_t) (response[5] & 0x1f), length = (uint8_t) (((response[5] >> 5) & 0x3) + 1);
@@ -874,10 +907,16 @@ void mbl_mw_datasignal_log(MblMwDataSignal *signal, void *context, MblMwFnDataLo
     state->pending_fns.push([=](void) -> void {
         state->next_logger= new MblMwDataLogger(signal, context, logger_ready);
         auto token = state->begin_request();
-        state->timeout= ThreadPool::schedule([context, state, logger_ready, token](void) -> void {
+        auto board = signal->owner;
+        state->timeout= ThreadPool::schedule([context, state, logger_ready, token, board](void) -> void {
             std::lock_guard<std::recursive_mutex> lock(state->mutex);
             if (!state->expire_request(token)) {
                 return;
+            }
+            // A multi-entry logger may have some of its entries made already; free those too.
+            for (auto it : state->next_logger->entry_ids) {
+                uint8_t command[3] = { MBL_MW_MODULE_LOGGING, ORDINAL(LoggingRegister::REMOVE), it };
+                SEND_COMMAND;
             }
             delete state->next_logger;
             state->next_logger = nullptr;
@@ -972,18 +1011,13 @@ int64_t calculate_epoch(const MblMwMetaWearBoard* board, uint32_t tick) {
 // Helper function - query loggers
 void query_active_loggers(MblMwMetaWearBoard* board) {
     auto state= GET_LOGGER_STATE(board);
+    std::lock_guard<std::recursive_mutex> lock(state->mutex);
     state->clear_data_loggers();
     state->anonymous_signals.clear();
     state->queryLogId = 0;
 
-    state->pending_fns.push([=](void) -> void {
-        state->timeout= ThreadPool::schedule([state, board](void) -> void {            
-            board->anon_signals_created(board->anon_signals_context, board, nullptr, MBL_MW_STATUS_ERROR_TIMEOUT);
-            state->create_next(true);
-        }, board->time_per_response);
-
-        uint8_t command[3]= {MBL_MW_MODULE_LOGGING, READ_REGISTER(ORDINAL(LoggingRegister::TRIGGER)), state->queryLogId};
-        SEND_COMMAND;
+    state->pending_fns.push([state, board](void) -> void {
+        read_logger_slot(state, board);
     });
     state->create_next(false);
 }

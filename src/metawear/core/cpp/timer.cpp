@@ -31,8 +31,11 @@ static int32_t timer_created(MblMwMetaWearBoard *board, const uint8_t *response,
     auto state = GET_TIMER_STATE(board);
     std::lock_guard<std::recursive_mutex> lock(state->mutex);
 
-    // Arrived after the request timed out; its callback has already reported failure.
+    // Arrived after the request timed out; its callback has already reported failure. The
+    // board still made the timer, so remove it rather than leave a slot nothing tracks.
     if (!state->end_request()) {
+        uint8_t command[3]= { MBL_MW_MODULE_TIMER, ORDINAL(TimerRegister::REMOVE), response[2] };
+        SEND_COMMAND;
         return MBL_MW_STATUS_OK;
     }
 

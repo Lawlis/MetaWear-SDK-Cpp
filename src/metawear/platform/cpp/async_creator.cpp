@@ -43,3 +43,8 @@ bool AsyncCreator::expire_request(uint64_t token) {
     request_in_flight = false;
     return true;
 }
+
+bool AsyncCreator::request_active() {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    return request_in_flight;
+}
